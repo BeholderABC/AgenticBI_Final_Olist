@@ -7,6 +7,7 @@ import streamlit as st
 
 from agents.graph import build_graph
 from agents.state import AgenticState
+from utils.startup_check import ensure_views_ready
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +29,19 @@ if "thread_id" not in st.session_state:
     st.session_state.thread_id = "default"
 if "history" not in st.session_state:
     st.session_state.history = []
+if "startup_checked" not in st.session_state:
+    with st.spinner("正在检查数据库与预聚合视图..."):
+        st.session_state.startup_status = ensure_views_ready(auto_refresh=True)
+    st.session_state.startup_checked = True
+
+startup = st.session_state.startup_status
+if not startup.database_ready:
+    st.error(startup.message)
+    if startup.missing_tables:
+        st.code("python -m utils.db_init", language="bash")
+    st.stop()
+elif startup.views_refreshed:
+    st.toast("已自动刷新缺失的预聚合视图", icon="✅")
 
 
 left, right = st.columns([0.48, 0.52], gap="large")
