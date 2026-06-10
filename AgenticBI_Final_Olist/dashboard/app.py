@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import pandas as pd
 import streamlit as st
@@ -9,8 +15,6 @@ from agents.graph import build_graph
 from agents.state import AgenticState
 from utils.startup_check import ensure_views_ready
 
-
-ROOT = Path(__file__).resolve().parents[1]
 
 def _get_field(obj, key: str, default=None):
     if obj is None:
@@ -57,9 +61,14 @@ with left:
 
     user_q = st.chat_input("请输入业务问题（支持多轮追问）")
     if user_q:
+        prior_history = list(st.session_state.history)
         st.session_state.history.append({"role": "user", "content": user_q})
 
-        init_state = AgenticState(user_question=user_q, quick_mode=True)
+        init_state = AgenticState(
+            user_question=user_q,
+            conversation_history=prior_history,
+            quick_mode=True,
+        )
         config = {"configurable": {"thread_id": st.session_state.thread_id}}
         try:
             with st.spinner("正在分析与生成图表（可能需要 10~60 秒）..."):
@@ -95,7 +104,11 @@ with right:
                 last_user_q = it["content"]
                 break
         if last_user_q:
-            init_state = AgenticState(user_question=last_user_q, quick_mode=False)
+            init_state = AgenticState(
+                user_question=last_user_q,
+                conversation_history=list(st.session_state.history),
+                quick_mode=False,
+            )
             config = {"configurable": {"thread_id": st.session_state.thread_id}}
             out_state = st.session_state.graph.invoke(init_state, config=config)
             st.session_state.last_state = out_state
