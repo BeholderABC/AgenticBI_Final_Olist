@@ -38,6 +38,8 @@ FORECAST_TERMS = ("预测", "未来", "6周", "六周", "forecast", "predict", "
 NLP_TERMS = ("评论", "差评", "好评", "情感", "review", "rating", "原因", "主题", "词云")
 DIAGNOSTIC_TERMS = ("为什么", "原因", "延迟", "差评率", "下钻", "显著高于", "诊断", "worse", "why")
 VIZ_TERMS = ("图", "可视化", "趋势", "排名", "分布", "对比", "chart", "plot")
+ANOMALY_TERMS = ("异常", "预警", "骤降", "突升", "anomaly", "突变", "检测", "风险")
+WHATIF_TERMS = ("如果", "假如", "下架", "移除", "what", "if", "模拟", "预估", "假设")
 FOLLOW_UP_TERMS = ("那", "它", "这个", "再", "继续", "准时率", "细化", "呢")
 
 
@@ -73,6 +75,8 @@ def _rule_based_plan(question: str, history: list[dict[str, str]]) -> dict[str, 
     forecast = any(k in q for k in FORECAST_TERMS)
     nlp = any(k in q for k in NLP_TERMS)
     diagnostic = any(k in q for k in DIAGNOSTIC_TERMS)
+    anomaly = any(k in q for k in ANOMALY_TERMS)
+    whatif = any(k in q for k in WHATIF_TERMS)
     viz = (not forecast and not nlp) or any(k in q for k in VIZ_TERMS)
 
     if forecast and (diagnostic or nlp):
@@ -140,6 +144,8 @@ def _rule_based_plan(question: str, history: list[dict[str, str]]) -> dict[str, 
             "forecast": forecast,
             "nlp": nlp or diagnostic,
             "viz": viz,
+            "anomaly": anomaly,
+            "whatif": whatif,
             "decision": True,
         },
         "context_rewrite": context_rewrite,

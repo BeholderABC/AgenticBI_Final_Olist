@@ -37,7 +37,7 @@ class DeepSeekClient:
             "messages": [{"role": m.role, "content": m.content} for m in messages],
             "temperature": temperature,
             "top_p": 1.0,
-            "max_tokens": 1024,
+            "max_tokens": 4096,
         }
 
         headers = {

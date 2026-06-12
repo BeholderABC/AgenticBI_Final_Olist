@@ -7,13 +7,50 @@ from langgraph.checkpoint.memory import MemorySaver
 from agents.state import AgenticState
 from agents.coordinator import plan_question
 from agents.sql_agent import run_sql_agent
-from agents.viz_agent import build_viz_bundle_for_charts
+from agents.viz_agent import build_viz_bundle_for_charts, build_default_viz_bundle
 from agents.viz_planner_agent import plan_charts
 from agents.nlp_agent import run_nlp_agent
 from agents.decision_agent import run_decision_agent
+from agents.anomaly_agent import run_anomaly_detection, _anomaly_alerts_to_dicts
 from models.forecast import forecast_6_weeks
+from models.whatif import run_whatif_delist_bad_sellers, format_whatif_report
 from utils.db import build_mysql_engine
 from sqlalchemy import text
+from typing import Any
+
+
+def _serialize_tables(tables: dict[str, pd.DataFrame]) -> dict[str, Any]:
+    """Convert DataFrames to msgpack-safe dicts (all numpy types → native Python)."""
+    import numpy as np
+
+    safe: dict[str, Any] = {}
+    for k, df in tables.items():
+        d = {}
+        for col in df.columns:
+            vals = df[col].tolist()
+            # Recursively convert any numpy scalars to Python types
+            clean_vals = []
+            for v in vals:
+                if isinstance(v, (np.integer,)):
+                    clean_vals.append(int(v))
+                elif isinstance(v, (np.floating,)):
+                    if np.isnan(v):
+                        clean_vals.append(None)
+                    else:
+                        clean_vals.append(float(v))
+                elif isinstance(v, (np.bool_,)):
+                    clean_vals.append(bool(v))
+                elif isinstance(v, (np.ndarray,)):
+                    clean_vals.append(v.tolist())
+                elif v is None or isinstance(v, (str, int, float, bool, list, dict)):
+                    clean_vals.append(v)
+                elif isinstance(v, (bytes,)):
+                    clean_vals.append(v.decode("utf-8", errors="replace"))
+                else:
+                    clean_vals.append(str(v))
+            d[col] = clean_vals
+        safe[k] = d
+    return safe
 
 
 def _coordinator_node(state: AgenticState) -> AgenticState:
@@ -97,6 +134,9 @@ def _analysis_node(state: AgenticState) -> AgenticState:
                   o.order_status,
                   COALESCE(t.product_category_name_english, pr.product_category_name, 'unknown') AS product_category_english,
                   pr.product_weight_g,
+                  pr.product_length_cm,
+                  pr.product_height_cm,
+                  pr.product_width_cm,
                   AVG(oi.freight_value) AS freight_value,
                   COUNT(DISTINCT oi.order_id) AS order_cnt
                 FROM order_items oi
@@ -105,7 +145,7 @@ def _analysis_node(state: AgenticState) -> AgenticState:
                 LEFT JOIN product_category_name_translation t
                   ON t.product_category_name = pr.product_category_name
                 WHERE pr.product_weight_g IS NOT NULL
-                GROUP BY 1, 2, 3
+                GROUP BY 1, 2, 3, 4, 5, 6
                 HAVING order_cnt >= 5
                 ORDER BY order_cnt DESC
                 LIMIT 2000
@@ -193,7 +233,9 @@ def _analysis_node(state: AgenticState) -> AgenticState:
     except Exception as e:
         tables["_question_error"] = pd.DataFrame([{"error": str(e)}])
 
-    state.tables = {k: v.to_dict(orient="list") for k, v in tables.items()}
+    # Serialize DataFrames to dicts, converting all numpy types to native Python
+    # (LangGraph uses msgpack which chokes on numpy.float64/int64/etc.)
+    state.tables = _serialize_tables(tables)
     return state
 
 
@@ -206,7 +248,20 @@ def _forecast_node(state: AgenticState) -> AgenticState:
         return state
 
     fc = forecast_6_weeks(monthly, fast_mode=state.quick_mode)
-    state.forecast = {"forecast": fc.df.to_dict(orient="list")}
+    # Convert forecast values to native Python types for msgpack compatibility
+    forecast_native: dict[str, list] = {}
+    raw_forecast = fc.df.to_dict(orient="list")
+    for col, vals in raw_forecast.items():
+        clean = []
+        for v in vals:
+            if isinstance(v, (float,)) and pd.isna(v):
+                clean.append(None)
+            elif isinstance(v, (float, int,)):
+                clean.append(v)
+            else:
+                clean.append(str(v) if v is not None else None)
+        forecast_native[col] = clean
+    state.forecast = {"forecast": forecast_native}
     return state
 
 
@@ -225,12 +280,14 @@ def _nlp_node(state: AgenticState) -> AgenticState:
     except Exception as e:
         state.nlp = {"summary": f"NLP agent failed: {e}", "top_negative_terms": []}
 
-    # pass negative terms to viz layer as a tiny table
+    # pass negative & positive terms to viz layer as tiny tables (C7/C2)
     try:
-        terms = state.nlp.get("top_negative_terms", []) if isinstance(state.nlp, dict) else []
-        if terms:
-            # store as a table-like payload (keeps the same serialization approach)
-            state.tables["_nlp_negative_terms"] = {"term": list(terms)}
+        neg_terms = state.nlp.get("top_negative_terms", []) if isinstance(state.nlp, dict) else []
+        pos_terms = state.nlp.get("top_positive_terms", []) if isinstance(state.nlp, dict) else []
+        if neg_terms:
+            state.tables["_nlp_negative_terms"] = {"term": list(neg_terms)}
+        if pos_terms:
+            state.tables["_nlp_positive_terms"] = {"term": list(pos_terms)}
     except Exception:
         pass
     return state
@@ -242,23 +299,78 @@ def _viz_node(state: AgenticState) -> AgenticState:
     if state.forecast.get("forecast"):
         forecast_df = pd.DataFrame(state.forecast["forecast"])
 
-    # Decide which charts are needed for this question (0-3).
-    # Empty => skip drawing for fastest response.
-    available = list(state.tables.keys())
-    plan = plan_charts(_effective_question(state), available, quick_mode=state.quick_mode)
-    state.requested_charts = plan.get("charts", []) if isinstance(plan, dict) else []
+    if state.quick_mode:
+        # Quick mode: select 1-4 focused charts matching the question
+        available = list(state.tables.keys())
+        plan = plan_charts(_effective_question(state), available, quick_mode=True)
+        state.requested_charts = plan.get("charts", []) if isinstance(plan, dict) else []
+        if state.requested_charts:
+            state.requested_charts = state.requested_charts[:4]
+        viz = build_viz_bundle_for_charts(
+            {**tables, **{k: pd.DataFrame(v) for k, v in state.tables.items() if k.startswith("_")}},
+            forecast_df,
+            chart_ids=state.requested_charts,
+        )
+        state.figures = viz.paths
+    else:
+        # Non-quick mode (重新生成图表 button): generate all available charts
+        viz = build_default_viz_bundle(
+            {**tables, **{k: pd.DataFrame(v) for k, v in state.tables.items() if k.startswith("_")}},
+            forecast_df,
+        )
+        state.figures = viz.paths
+        state.requested_charts = []
+    return state
 
-    # quick mode safety: avoid the slowest charts even if requested
-    if state.quick_mode and state.requested_charts:
-        deny = {"geo_bubble_state", "wordcloud_negative"}
-        state.requested_charts = [c for c in state.requested_charts if c not in deny][:2]
 
-    viz = build_viz_bundle_for_charts(
-        {**tables, **{k: pd.DataFrame(v) for k, v in state.tables.items() if k.startswith("_")}},
-        forecast_df,
-        chart_ids=state.requested_charts,
-    )
-    state.figures = viz.paths
+# ===========================================================================
+# C8: What-if Simulation Node
+# ===========================================================================
+
+def _whatif_node(state: AgenticState) -> AgenticState:
+    """Run What-if simulation: estimate platform score uplift from delisting worst sellers."""
+    q = _effective_question(state).lower()
+    if not any(k in q for k in ["what", "if", "如果", "假如", "下架", "移除", "模拟", "预估"]):
+        return state
+    try:
+        result = run_whatif_delist_bad_sellers(top_n=20)
+        report = format_whatif_report(result)
+        state.whatif = {
+            "success": result.success,
+            "report": report,
+            "current_score": result.current_platform_avg_score,
+            "new_score": result.new_platform_avg_score,
+            "score_uplift": result.score_uplift,
+            "score_uplift_pct": result.score_uplift_pct,
+            "removed_seller_count": result.removed_seller_count,
+            "removed_order_count": result.removed_order_count,
+        }
+    except Exception as e:
+        state.whatif = {"success": False, "report": f"What-if simulation failed: {e}"}
+    return state
+
+
+# ===========================================================================
+# C9: Anomaly Detection Node
+# ===========================================================================
+
+def _anomaly_node(state: AgenticState) -> AgenticState:
+    """Run anomaly detection: scan for state-level order drops and delivery spikes."""
+    q = _effective_question(state).lower()
+    if state.quick_mode and not any(k in q for k in ["异常", "预警", "骤降", "突升", "anomaly", "突变", "检测"]):
+        state.anomaly = {}
+        return state
+    try:
+        report = run_anomaly_detection()
+        alerts_dict = _anomaly_alerts_to_dicts(report.alerts)
+        state.anomaly = {
+            "success": report.success,
+            "summary": report.summary,
+            "alerts": alerts_dict,
+            "alert_count": len(report.alerts),
+        }
+    except Exception as e:
+        state.anomaly = {"success": False, "summary": f"Anomaly detection failed: {e}", "alerts": []}
     return state
 
 
@@ -434,6 +546,23 @@ def _route_after_nlp(state: AgenticState) -> str:
     return "decision"
 
 
+def _route_after_viz(state: AgenticState) -> str:
+    """After viz, route to anomaly/whatif if requested, else to decision."""
+    if state.route.get("anomaly"):
+        return "anomaly"
+    if state.route.get("whatif"):
+        return "whatif"
+    return "decision"
+
+
+def _route_after_specialties(state: AgenticState) -> str:
+    """After anomaly or whatif, check if the other special agent is also needed."""
+    # Track which specialty nodes have run via state.route
+    if state.route.get("whatif") and state.route.get("anomaly"):
+        return "decision"  # both run, go to decision
+    return "decision"
+
+
 def build_graph():
     g = StateGraph(AgenticState)
     g.add_node("coordinator", _coordinator_node)
@@ -441,6 +570,9 @@ def build_graph():
     g.add_node("forecast", _forecast_node)
     g.add_node("nlp", _nlp_node)
     g.add_node("viz", _viz_node)
+    # C8/C9: bonus specialty agents (routed conditionally via coordinator)
+    g.add_node("anomaly", _anomaly_node)
+    g.add_node("whatif", _whatif_node)
     g.add_node("decision", _decision_node)
 
     g.set_entry_point("coordinator")
@@ -456,7 +588,14 @@ def build_graph():
         {"nlp": "nlp", "viz": "viz", "decision": "decision"},
     )
     g.add_conditional_edges("nlp", _route_after_nlp, {"viz": "viz", "decision": "decision"})
-    g.add_edge("viz", "decision")
+    # After viz, route to anomaly/whatif if the question warrants it
+    g.add_conditional_edges(
+        "viz",
+        _route_after_viz,
+        {"anomaly": "anomaly", "whatif": "whatif", "decision": "decision"},
+    )
+    g.add_conditional_edges("anomaly", _route_after_specialties, {"decision": "decision"})
+    g.add_conditional_edges("whatif", _route_after_specialties, {"decision": "decision"})
     g.add_edge("decision", END)
 
     return g.compile(checkpointer=MemorySaver())

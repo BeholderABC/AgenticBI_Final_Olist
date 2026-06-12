@@ -16,6 +16,14 @@ from agents.state import AgenticState
 from utils.startup_check import ensure_views_ready
 
 
+def _escape_strikethrough(text: str) -> str:
+    """Replace ``--`` between word chars with en-dash to prevent Markdown <del>."""
+    import re
+    # Match "--" that is surrounded on both sides by word-like characters
+    # (letters, digits, %, ￥, $, etc.) — typical LLM range notation.
+    return re.sub(r'~', '–', text)
+
+
 def _get_field(obj, key: str, default=None):
     if obj is None:
         return default
@@ -57,7 +65,11 @@ with left:
         if role == "user":
             st.chat_message("user").write(item["content"])
         else:
-            st.chat_message("assistant").write(item["content"])
+            # Escape "--" between word chars (e.g. "79%--83%") to prevent
+            # Markdown strikethrough rendering while keeping all other formatting.
+            sanitized = _escape_strikethrough(item["content"])
+            st.chat_message("assistant").write(sanitized)
+
 
     user_q = st.chat_input("请输入业务问题（支持多轮追问）")
     if user_q:
@@ -121,9 +133,20 @@ with right:
         tables = _get_field(state, "tables", {}) or {}
 
         if figures:
+            html_figs = []
+            img_figs = []
             for p in figures:
-                if Path(p).exists():
-                    st.image(p, use_container_width=True)
+                if not Path(p).exists():
+                    continue
+                if Path(p).suffix.lower() in (".html",):
+                    html_figs.append(p)
+                else:
+                    img_figs.append(p)
+            for p in img_figs:
+                st.image(p, use_container_width=True)
+            for p in html_figs:
+                with open(p, "r", encoding="utf-8") as f:
+                    st.components.v1.html(f.read(), height=500)
 
         if tables:
             with st.expander("数据表（节选）", expanded=False):

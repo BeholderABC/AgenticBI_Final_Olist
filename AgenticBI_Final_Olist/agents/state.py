@@ -21,5 +21,8 @@ class AgenticState:
     figures: list[str] = field(default_factory=list)  # file paths
     forecast: dict[str, Any] = field(default_factory=dict)
     nlp: dict[str, Any] = field(default_factory=dict)
+    # C8-C9 additions: what-if simulation and anomaly detection results
+    whatif: dict[str, Any] = field(default_factory=dict)
+    anomaly: dict[str, Any] = field(default_factory=dict)
     final_answer: str = ""
 
