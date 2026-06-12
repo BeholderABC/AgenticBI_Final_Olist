@@ -7,7 +7,7 @@ __pycache__/
 .ruff_cache/
 .DS_Store
 
-data/raw/
-data/artifacts/
+#data/raw/
+#data/artifacts/
 
 分工信息.txt
